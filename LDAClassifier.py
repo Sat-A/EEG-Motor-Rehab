@@ -4,71 +4,73 @@ import time
 from collections import deque
 import mne
 from scipy.signal import spectrogram
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 # =============================================
-# Optimized EEG Data Processor
+# EEG Data Loader with Optional Trimming
 # =============================================
 class RealEEGDataLoader:
-    def __init__(self, file_path, channels, rest_duration=5, window_size=1.0):
-        # Load and preprocess EEG data
+    def __init__(self, file_path, channels, rest_duration=30, window_size=1.0, max_duration=None):
         self.raw = mne.io.read_raw_edf(file_path, preload=True)
         self.sfreq = self.raw.info['sfreq']
         self.raw.pick(channels)
-        
-        # Convert to numpy array and average channels
+
+        # Limit duration if specified
+        if max_duration is not None:
+            max_samples = int(max_duration * self.sfreq)
+            self.raw = self.raw.copy().crop(tmax=max_duration)
+
         data, _ = self.raw[:, :]
         self.data = np.mean(data, axis=0)
-        
-        # Calculate window parameters
+
         self.nperseg = int(window_size * self.sfreq)
         self.window_size = window_size
         self.rest_duration = rest_duration
-        
-        # Compute spectrogram (vectorized)
+
         freqs, _, Sxx = spectrogram(self.data, fs=self.sfreq,
                                    nperseg=self.nperseg,
                                    noverlap=0,
                                    mode='psd')
-        
-        # Calculate band powers for all windows
+
         mu_band = (freqs >= 8) & (freqs <= 12)
         beta_band = (freqs >= 13) & (freqs <= 30)
-        
+
         self.mu_power = np.sum(Sxx[mu_band, :], axis=0)
         self.beta_power = np.sum(Sxx[beta_band, :], axis=0)
-        self.total_power = self.mu_power + self.beta_power
-        
-        # Calculate baseline power
-        self.rest_windows = int(rest_duration/window_size)
-        self.rest_power = np.mean(self.total_power[:self.rest_windows])
-        
-        # Store precomputed times
-        self.times = np.arange(len(self.total_power)) * window_size
+
+        self.rest_windows = int(rest_duration / window_size)
+        self.times = np.arange(len(self.mu_power)) * window_size
         self.current_idx = 0
 
     def get_sample(self):
-        if self.current_idx >= len(self.total_power):
-            return None, None
-        power = self.total_power[self.current_idx]
+        if self.current_idx >= len(self.mu_power):
+            return None
+        mu = self.mu_power[self.current_idx]
+        beta = self.beta_power[self.current_idx]
         t = self.times[self.current_idx]
         self.current_idx += 1
-        return power, t
+        return (mu, beta), t
 
 # =============================================
-# Optimized Controller Components
+# Classifier and Mapping Components
 # =============================================
-def compute_erd(current_power, rest_power):
-    return max(0, min((1 - (current_power / rest_power)) * 100, 100))
+def get_dummy_lda():
+    # Dummy LDA classifier trained on synthetic data
+    X_train = np.random.rand(100, 2) * [20, 30]
+    y_train = (X_train[:, 0] < 10).astype(int)  # Simulate intention/no-intention
+    lda = LinearDiscriminantAnalysis()
+    lda.fit(X_train, y_train)
+    return lda
 
-def map_to_ems(erd_percent, max_erd=70):
-    return np.clip(10 - (erd_percent / max_erd) * 9, 1, 10)
+def map_to_ems(class_output):
+    return 8.0 if class_output == 1 else 2.0
 
 class FastSmoother:
     def __init__(self, window_size=5):
         self.buffer = np.zeros(window_size)
         self.idx = 0
         self.full = False
-        
+
     def update(self, value):
         if self.full:
             self.buffer[:-1] = self.buffer[1:]
@@ -83,8 +85,8 @@ class FastSmoother:
 class RampLimiter:
     def __init__(self, max_rate=2):
         self.prev_value = 5.0
-        self.max_delta = max_rate * 0.1  # Per 0.1s step
-        
+        self.max_delta = max_rate * 0.1
+
     def apply(self, target):
         delta = np.clip(target - self.prev_value, -self.max_delta, self.max_delta)
         self.prev_value += delta
@@ -94,78 +96,85 @@ class RampLimiter:
 # Main Processing Loop
 # =============================================
 if __name__ == "__main__":
-    # Configuration
     FILE_PATH = "sub-01_task-motor-imagery_eeg.edf"
-    # CHANNELS = ["C3", "C4"]
-    CHANNELS = ["C1", "C2", "C3", "C4", "Cz", "FC1", "FC2", "FC3", "FC4", "CP1", "CP2", "CP3", "CP4"]
+    CHANNELS = ["C3", "C4", "Cz", "FC3", "FC4", "CP3", "CP4"]
     WINDOW_SIZE = 1.0
-    
-    # Initialize components
-    eeg_loader = RealEEGDataLoader(FILE_PATH, CHANNELS)
+    MAX_DURATION = 60  # seconds
+
+    eeg_loader = RealEEGDataLoader(FILE_PATH, CHANNELS, window_size=WINDOW_SIZE, max_duration=MAX_DURATION)
     smoother = FastSmoother(window_size=5)
     ramp_limiter = RampLimiter(max_rate=2)
-    
-    # Preallocate arrays
-    max_windows = len(eeg_loader.total_power)
+    lda_model = get_dummy_lda()
+
+    max_windows = len(eeg_loader.mu_power)
     timestamps = np.zeros(max_windows)
-    eeg_power = np.zeros(max_windows)
-    erd_values = np.zeros(max_windows)
+    mu_values = np.zeros(max_windows)
+    beta_values = np.zeros(max_windows)
     ems_values = np.zeros(max_windows)
-    
+    predictions = np.zeros(max_windows)
+    time_taken = []
+
     idx = 0
     while True:
-        power, t = eeg_loader.get_sample()
-        if power is None:
+        start_time = time.time()
+        result = eeg_loader.get_sample()
+        if result is None:
             break
-        
-        # During rest period: zero EMS
+        (mu, beta), t = result
+
         if t < eeg_loader.rest_duration:
             final_ems = 0.0
+            pred = 0
         else:
-            # Compute ERD and EMS
-            erd = compute_erd(power, eeg_loader.rest_power)
-            raw_ems = map_to_ems(erd)
+            X = np.array([[mu, beta]])
+            pred = lda_model.predict(X)[0]
+            raw_ems = map_to_ems(pred)
             smoothed_ems = smoother.update(raw_ems)
             safe_ems = ramp_limiter.apply(smoothed_ems)
             final_ems = np.clip(safe_ems, 2, 8)
-        
-        # Store results
+
         timestamps[idx] = t
-        eeg_power[idx] = power
-        erd_values[idx] = erd if t >= eeg_loader.rest_duration else 0
+        mu_values[idx] = mu
+        beta_values[idx] = beta
         ems_values[idx] = final_ems
+        predictions[idx] = pred
         idx += 1
-        
-        # Simulate real-time (adjust sleep based on actual processing time)
-        time.sleep(WINDOW_SIZE * 0.9)  # Compensate for processing time
-    
-    # Truncate unused preallocated space
+
+        end_time = time.time()
+        time_taken.append(end_time - start_time)
+        time.sleep(WINDOW_SIZE * 0.9)
+
     timestamps = timestamps[:idx]
-    eeg_power = eeg_power[:idx]
-    erd_values = erd_values[:idx]
+    mu_values = mu_values[:idx]
+    beta_values = beta_values[:idx]
     ems_values = ems_values[:idx]
-    
-    # Visualization
+    predictions = predictions[:idx]
+
+    print("Average time taken: ", np.mean(time_taken))
+    print("Max time taken: ", np.max(time_taken))
+
     plt.figure(figsize=(12, 8))
-    
+
     plt.subplot(3, 1, 1)
-    plt.plot(timestamps, eeg_power)
+    plt.plot(timestamps, mu_values, label='Mu Power')
+    plt.plot(timestamps, beta_values, label='Beta Power')
     plt.axvline(eeg_loader.rest_duration, color='r', linestyle='--')
-    plt.ylabel('Power\n(mu + beta)')
-    plt.title(f'EEG Power (Baseline: {eeg_loader.rest_power:.2f} µV²)')
-    
+    plt.legend()
+    plt.ylabel('Power')
+    plt.title('Mu and Beta Band Power')
+
     plt.subplot(3, 1, 2)
-    plt.plot(timestamps, erd_values, 'orange')
+    plt.plot(timestamps, predictions, 'orange')
     plt.axvline(eeg_loader.rest_duration, color='r', linestyle='--')
-    plt.ylabel('ERD (%)')
-    plt.ylim(0, 100)
-    
+    plt.ylabel('LDA Output')
+    plt.yticks([0, 1])
+
     plt.subplot(3, 1, 3)
     plt.plot(timestamps, ems_values, 'red')
     plt.axvline(eeg_loader.rest_duration, color='r', linestyle='--')
     plt.ylabel('EMS Level')
     plt.xlabel('Time (s)')
     plt.ylim(0, 10)
-    
+
     plt.tight_layout()
     plt.show()
