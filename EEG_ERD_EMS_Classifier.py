@@ -20,6 +20,10 @@ class RealEEGDataLoader:
         # Convert to numpy array and average channels
         data, _ = self.raw[:, :]
         self.data = np.mean(data, axis=0)
+
+        # # Trim first 15 seconds
+        # trim_samples = int(15 * self.sfreq)
+        # self.data = self.data[trim_samples:int(150 * self.sfreq)]
         
         # Calculate window parameters
         self.nperseg = int(window_size * self.sfreq)
@@ -62,11 +66,11 @@ class RealEEGDataLoader:
 def compute_erd(current_power, rest_power):
     return max(0, min((1 - (current_power / rest_power)) * 100, 100))
 
-def map_to_ems(erd_percent, max_erd=70):
+def map_to_ems(erd_percent, max_erd=20):
     return np.clip(10 - (erd_percent / max_erd) * 9, 1, 10)
 
 class FastSmoother:
-    def __init__(self, window_size=5):
+    def __init__(self, window_size=2):
         self.buffer = np.zeros(window_size)
         self.idx = 0
         self.full = False
@@ -83,7 +87,7 @@ class FastSmoother:
         return self.buffer[:self.idx].mean() if not self.full else self.buffer.mean()
 
 class RampLimiter:
-    def __init__(self, max_rate=2):
+    def __init__(self, max_rate=3):
         self.prev_value = 5.0
         self.max_delta = max_rate * 0.1  # Per 0.1s step
         
